@@ -52,6 +52,9 @@ Il faut aussi les services nécessaires au fonctionnement :
 sudo apt install mariadb-server apache2 jackd2
 ```
 
+Pour le streaming Icecast et les métadonnées (sections 10 et 11), ajoute
+`glasscoder` et `python3-mysqldb`.
+
 `qtwebengine5-dev` installe Chromium embarqué, ce qui représente plusieurs
 centaines de Mo.
 
@@ -246,6 +249,161 @@ rmlsend 'LM https://example.org/!'
 Pour revenir à un message texte : `rmlsend 'LB Bonjour!'` (ou `LC <couleur> <texte>!` pour un texte en couleur). Attention, l'URL
 chargée avec `LM` est mémorisée et rechargée au prochain démarrage de
 rdairplay.
+
+## 10. Diffuser vers Icecast avec GlassCoder
+
+[GlassCoder](https://github.com/ElvishArtisan/GlassCoder) encode un flux JACK
+et l'envoie à un serveur Icecast. Le paquet Debian suffit :
+
+```sh
+sudo apt install glasscoder
+```
+
+Le principe : `caed` lance GlassCoder comme un client JACK de plus, dans le même
+serveur jackd que Rivendell, et on relie `playout_0` à ses entrées. Le flux
+démarre et s'arrête donc avec le service `rivendell`.
+
+### a) Identifiants Icecast
+
+Crée `/etc/glasscoder/webradio.cred`, lisible par root seulement :
+
+```ini
+[Credentials]
+Username=source
+Password=MOT_DE_PASSE_SOURCE
+```
+
+```sh
+sudo install -d -m 700 /etc/glasscoder
+sudo chmod 600 /etc/glasscoder/webradio.cred
+```
+
+### b) Script de lancement
+
+Comme `caed` n'utilise pas de shell, un petit script lance GlassCoder, connecte
+ses ports dès qu'ils apparaissent, et le relance s'il s'arrête. Enregistre-le
+dans `/usr/local/bin/rd-glasscoder` (`sudo chmod 755`), puis adapte l'URL du
+serveur, le format et le nom du flux :
+
+```bash
+#!/bin/bash
+# Diffuse playout_0 de Rivendell vers Icecast avec glasscoder(1).
+CLIENT=glasscoder
+SOURCE_L=rivendell_0:playout_0L
+SOURCE_R=rivendell_0:playout_0R
+
+export JACK_PROMISCUOUS_SERVER=${JACK_PROMISCUOUS_SERVER:-audio}
+
+GC_PID=
+trap '[ -n "$GC_PID" ] && kill "$GC_PID" 2>/dev/null; exit 0' TERM INT
+
+connect_ports() {
+  for i in $(seq 1 30); do
+    if jack_lsp 2>/dev/null | grep -qx "$CLIENT:input_2"; then
+      jack_connect "$SOURCE_L" "$CLIENT:input_1" 2>/dev/null
+      jack_connect "$SOURCE_R" "$CLIENT:input_2" 2>/dev/null
+      logger -t rd-glasscoder "ports JACK connectés ($SOURCE_L/R -> $CLIENT)"
+      return 0
+    fi
+    sleep 1
+  done
+  logger -t rd-glasscoder "ports $CLIENT:input_* introuvables après 30 s"
+  return 1
+}
+
+while :; do
+  /usr/bin/glasscoder \
+    --audio-device=jack \
+    --jack-client-name="$CLIENT" \
+    --audio-format=mp3 \
+    --audio-bitrate=256 \
+    --audio-samplerate=44100 \
+    --audio-channels=2 \
+    --server-type=icecast2 \
+    --server-url=http://icecast.example.org:8000/webradio \
+    --credentials-file=/etc/glasscoder/webradio.cred \
+    --stream-name="Ma radio" \
+    --errors-to=syslog \
+    --errors-string=webradio &
+  GC_PID=$!
+  connect_ports
+  wait "$GC_PID"
+  logger -t rd-glasscoder "glasscoder s'est arrêté (code $?), relance dans 5 s"
+  GC_PID=
+  sleep 5
+done
+```
+
+GlassCoder rééchantillonne lui-même de 48 kHz (JACK) vers la fréquence
+demandée avec `--audio-samplerate`.
+
+### c) Le faire démarrer par Rivendell
+
+Dans rdadmin, va dans Manage Hosts → *ton hôte* → **JACK Settings**, puis
+ajoute `/usr/local/bin/rd-glasscoder` à **JACK Clients to Start**, et
+redémarre le service :
+
+```sh
+sudo systemctl restart rivendell
+```
+
+### d) Vérifier
+
+```sh
+pgrep -a glasscoder
+journalctl -t rd-glasscoder -t glasscoder --since "-5min"
+JACK_PROMISCUOUS_SERVER=audio jack_lsp -c | grep -A2 playout_0
+```
+
+Chaque port `playout_0L/R` doit aller vers `system:playback_*` et vers
+`glasscoder:input_*`. Le point de montage doit aussi apparaître sur la page
+d'état d'Icecast (`/status.xsl`).
+
+## 11. Envoyer le titre en cours à Icecast avec PyPAD
+
+PyPAD est le système de métadonnées (PAD) de Rivendell. Le script
+`pypad_icecast2.py`, fourni avec Rivendell, met à jour le titre d'un point de
+montage Icecast à chaque nouveau morceau. Il a besoin de :
+
+```sh
+sudo apt install python3-mysqldb
+```
+
+Dans rdadmin, va dans Manage Hosts → *ton hôte* → **PyPAD Instances** →
+**Add**, puis choisis
+`/usr/lib/rivendell/pypad/pypad_icecast2.py`. La configuration proposée vient
+de `pypad_icecast2.exemplar`. Adapte au minimum ces lignes de la section
+`[Icecast1]` :
+
+```ini
+[Icecast1]
+Username=source
+Password=MOT_DE_PASSE_SOURCE
+Hostname=icecast.example.org
+Tcpport=8000
+Mountpoint=/webradio
+FormatString=%a - %t
+MasterLog=Yes
+Aux1Log=No
+Aux2Log=No
+```
+
+`%a` est l'artiste et `%t` le titre. Les autres codes sont décrits dans
+l'exemplar. `MasterLog=Yes` envoie les titres du log principal de rdairplay.
+Le compte doit pouvoir accéder à `/admin/metadata` d'Icecast : c'est le cas du
+compte source du point de montage.
+
+L'instance démarre tout de suite. Pour vérifier, lance un titre dans rdairplay,
+puis :
+
+```sh
+journalctl -u rivendell --since "-5min" | grep pypad_icecast2
+# ... Updating http://icecast.example.org/webradio: song=Artiste - Titre
+```
+
+En cas d'erreur, rdadmin affiche le code de sortie et l'erreur de l'instance
+(bouton **Error Log**). `No module named 'MySQLdb'` signifie qu'il manque
+`python3-mysqldb`.
 
 ## Mettre à jour depuis le dépôt officiel
 
